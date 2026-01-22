@@ -11,13 +11,12 @@ from src.vae import VAE
 from src.rnn import MDNRNN
 
 # --- CONFIGURATION ---
-POPULATION_SIZE = 64  # Keep this <= CPU Cores
+POPULATION_SIZE = 4
 GENERATIONS = 150
 FRAME_SKIP = 4
 TIME_LIMIT = 1000
-ENV_NAME = "CarRacing-v2"  # Gymnasium standard is v2
+ENV_NAME = "CarRacing-v3"   # <--- CHANGE THIS from v2 to v3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # Files
 VAE_PATH = "./vae.pth"
 RNN_PATH = "./rnn.pth"
@@ -36,34 +35,37 @@ def worker_process(conn):
     """
     Runs in a separate process using CPU.
     """
-    # Gymnasium requires render_mode="rgb_array" to return pixels
     env = gym.make(ENV_NAME, render_mode="rgb_array")
 
     while True:
         cmd, data = conn.recv()
 
         if cmd == 'reset':
-            # Gymnasium reset returns (obs, info)
             obs, _ = env.reset()
+
+            # --- POPRAWKA: Musimy przeskalować też po resecie! ---
+            if obs is not None:
+                obs = obs[:84, :, :]  # Ucięcie paska stanu
+                obs = cv2.resize(obs, (64, 64))  # Zmniejszenie do 64x64
+            # -----------------------------------------------------
+
             conn.send(obs)
 
         elif cmd == 'step':
             action = data
             total_reward = 0
 
-            # Frame Skip Loop
             for _ in range(FRAME_SKIP):
-                # Gymnasium returns 5 values
                 obs, reward, terminated, truncated, _ = env.step(action)
                 total_reward += reward
                 if terminated or truncated:
                     break
 
-            # Pre-crop on CPU (Save bandwidth)
-            # (96, 96, 3) -> (64, 64, 3)
+            # --- To już tu było i jest poprawne ---
             if obs is not None:
                 obs = obs[:84, :, :]
                 obs = cv2.resize(obs, (64, 64))
+            # --------------------------------------
 
             done = terminated or truncated
             conn.send((obs, total_reward, done))
@@ -71,7 +73,6 @@ def worker_process(conn):
         elif cmd == 'close':
             env.close()
             break
-
 
 # --- MASTER CLASS ---
 class ParallelTrainer:
