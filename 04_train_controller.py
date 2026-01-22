@@ -16,7 +16,7 @@ from src.vae import VAE
 from src.rnn import MDNRNN
 
 # --- KONFIGURACJA ---
-POPULATION_SIZE = 64  # Dostosowane do Twojego CPU
+POPULATION_SIZE = 4  # Dostosowane do Twojego CPU
 GENERATIONS = 150  # Liczba pokoleń
 FRAME_SKIP = 4  # Decyzja co 4 klatki
 TIME_LIMIT = 1000  # Limit kroków w epizodzie
