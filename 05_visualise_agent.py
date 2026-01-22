@@ -14,7 +14,7 @@ from src.rnn import MDNRNN
 # --- KONFIGURACJA ---
 ENV_NAME = "CarRacing-v3"
 VIDEO_FILENAME = "best_lap.mp4"
-SEED = 5005 # Seed toru, który chcesz zobaczyć (np. ten z walidacji)
+SEED = 1101 # Seed toru, który chcesz zobaczyć (np. ten z walidacji)
 TIME_LIMIT = 1000
 
 # Ścieżki do modeli
