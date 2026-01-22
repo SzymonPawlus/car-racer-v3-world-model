@@ -9,35 +9,39 @@ import time
 import os
 import sys
 
-# Importy lokalne
+# Dodajemy bieżący katalog do ścieżki, żeby widzieć folder src
 sys.path.append(os.getcwd())
 from src.vae import VAE
 from src.rnn import MDNRNN
 
 # --- KONFIGURACJA ---
-POPULATION_SIZE = 64  # Dostosowane do Twojego CPU
-GENERATIONS = 150  # Liczba pokoleń
-FRAME_SKIP = 4  # Decyzja co 4 klatki
+POPULATION_SIZE = 64  # Liczba równoległych agentów (dostosuj do CPU)
+GENERATIONS = 200  # Liczba pokoleń (zwiększyłem, bo robisz fine-tuning)
+FRAME_SKIP = 4  # Decyzja co 4 klatki gry
 TIME_LIMIT = 1000  # Limit kroków w epizodzie
-ENV_NAME = "CarRacing-v3"  # Gymnasium environment
+ENV_NAME = "CarRacing-v3"  # Nowa wersja środowiska Gymnasium
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Ścieżki
+# Ścieżki do plików
 VAE_PATH = "./vae.pth"
 RNN_PATH = "./rnn.pth"
-CTRL_PATH = "./controller_best.pth"
-BACKUP_PATH = "./controller_backup.pth"  # Zapisujemy tu najlepszego z danej generacji
+CTRL_PATH = "./controller_best.pth"  # Tu zapisujemy "Mistrza" (zwalidowanego)
+BACKUP_PATH = "./controller_backup.pth"  # Tu zapisujemy najlepszego z bieżącej epoki (backup)
 LOG_FILE = "./training_log.txt"
 
-# Parametry sieci
+# Parametry sieci (muszą pasować do wytrenowanych modeli VAE/RNN)
 LATENT_SIZE = 32
 HIDDEN_SIZE = 256
 ACTION_SIZE = 3
-INPUT_SIZE = LATENT_SIZE + HIDDEN_SIZE  # 288
+INPUT_SIZE = LATENT_SIZE + HIDDEN_SIZE  # 32 + 256 = 288
 
 
 # --- PROCES ROBOCZY (CPU) ---
 def worker_process(conn):
+    """
+    Działa w oddzielnym procesie. Obsługuje fizykę gry (Box2D).
+    """
+    # render_mode="rgb_array" jest wymagany w Gymnasium do pobierania pikseli
     env = gym.make(ENV_NAME, render_mode="rgb_array")
 
     while True:
@@ -47,22 +51,30 @@ def worker_process(conn):
             break
 
         if cmd == 'reset':
+            # Odbieramy seed od Mastera
             seed = data
             obs, _ = env.reset(seed=seed)
+
+            # --- WAŻNE: Skalowanie obrazka startowego (Naprawa błędu VAE) ---
             if obs is not None:
-                obs = obs[:84, :, :]
-                obs = cv2.resize(obs, (64, 64))
+                obs = obs[:84, :, :]  # Ucięcie paska stanu
+                obs = cv2.resize(obs, (64, 64))  # Zmniejszenie do 64x64
+            # ----------------------------------------------------------------
+
             conn.send(obs)
 
         elif cmd == 'step':
             action = data
             total_reward = 0
+
+            # Frame Skip
             for _ in range(FRAME_SKIP):
                 obs, reward, terminated, truncated, _ = env.step(action)
                 total_reward += reward
                 if terminated or truncated:
                     break
 
+            # Przetwarzanie obrazka
             if obs is not None:
                 obs = obs[:84, :, :]
                 obs = cv2.resize(obs, (64, 64))
@@ -82,7 +94,7 @@ class ParallelTrainer:
         self.parents = []
         self.processes = []
 
-        print(f"[{time.strftime('%H:%M:%S')}] Spawning {pop_size} workers...")
+        print(f"[{time.strftime('%H:%M:%S')}] Uruchamianie {pop_size} workerów...")
         mp.set_start_method('spawn', force=True)
 
         for _ in range(pop_size):
@@ -92,7 +104,7 @@ class ParallelTrainer:
             self.parents.append(parent)
             self.processes.append(p)
 
-        print(f"[{time.strftime('%H:%M:%S')}] Loading VAE/RNN to {DEVICE}...")
+        print(f"[{time.strftime('%H:%M:%S')}] Ładowanie modeli VAE i RNN na {DEVICE}...")
         self.vae = VAE(latent_size=LATENT_SIZE).to(DEVICE)
         self.vae.load_state_dict(torch.load(VAE_PATH, map_location=DEVICE))
         self.vae.eval()
@@ -103,7 +115,10 @@ class ParallelTrainer:
         self.rnn.eval()
 
     def batched_rollout(self, solutions):
-        # 1. Prepare weights
+        """
+        Wykonuje jedną generację równolegle.
+        """
+        # 1. Konwersja parametrów na macierze wag
         weights_list = []
         biases_list = []
         num_weights = ACTION_SIZE * INPUT_SIZE
@@ -117,16 +132,18 @@ class ParallelTrainer:
         W_batch = torch.tensor(np.array(weights_list), dtype=torch.float32).to(DEVICE)
         b_batch = torch.tensor(np.array(biases_list), dtype=torch.float32).unsqueeze(2).to(DEVICE)
 
-        # 2. Sync Seed
+        # 2. Synchronizacja toru (Seed)
+        # Losujemy JEDEN seed dla całego pokolenia
         current_seed = np.random.randint(0, 100000)
 
+        # Reset workerów
         current_obs = []
         for parent in self.parents:
             parent.send(('reset', current_seed))
         for parent in self.parents:
             current_obs.append(parent.recv())
 
-        # 3. Init RNN
+        # 3. Inicjalizacja RNN
         rnn_hidden = (
             torch.zeros(1, self.pop_size, HIDDEN_SIZE).to(DEVICE),
             torch.zeros(1, self.pop_size, HIDDEN_SIZE).to(DEVICE)
@@ -136,29 +153,34 @@ class ParallelTrainer:
         dones = np.zeros(self.pop_size, dtype=bool)
         step_count = 0
 
-        # 4. Loop
+        # 4. Pętla symulacji
         while not all(dones) and step_count < TIME_LIMIT:
+            # A. Wizja (VAE)
             obs_batch = np.array(current_obs, dtype=np.float32) / 255.0
             obs_tensor = torch.tensor(obs_batch).permute(0, 3, 1, 2).to(DEVICE)
 
             with torch.no_grad():
                 mu, _ = self.vae.encode(obs_tensor)
 
+            # B. Decyzja (Kontroler)
             h_state = rnn_hidden[0].squeeze(0)
             controller_input = torch.cat([mu, h_state], dim=1).unsqueeze(2)
 
+            # Równoległe obliczenia dla wszystkich agentów
             action_out = torch.bmm(W_batch, controller_input) + b_batch
             action_out = action_out.squeeze(2)
 
-            s = torch.tanh(action_out[:, 0])
-            g = torch.sigmoid(action_out[:, 1])
-            b = torch.sigmoid(action_out[:, 2])
+            s = torch.tanh(action_out[:, 0])  # Skręt
+            g = torch.sigmoid(action_out[:, 1])  # Gaz
+            b = torch.sigmoid(action_out[:, 2])  # Hamulec
             actions = torch.stack([s, g, b], dim=1).cpu().numpy()
 
+            # C. Fizyka
             for i, parent in enumerate(self.parents):
                 if not dones[i]:
                     parent.send(('step', actions[i]))
 
+            # D. Odbiór wyników
             for i, parent in enumerate(self.parents):
                 if not dones[i]:
                     obs, reward, is_done = parent.recv()
@@ -167,20 +189,26 @@ class ParallelTrainer:
 
                     if is_done:
                         dones[i] = True
-                    if total_rewards[i] < -50:  # Early kill bad agents
+                    # Early stopping (jeśli auto stoi/cofa)
+                    if total_rewards[i] < -50:
                         dones[i] = True
 
             step_count += 1
 
+            # E. Pamięć (RNN)
             z_in = mu.unsqueeze(1)
             a_in = torch.tensor(actions, dtype=torch.float32).unsqueeze(1).to(DEVICE)
             with torch.no_grad():
                 _, _, _, rnn_hidden = self.rnn(z_in, a_in, rnn_hidden)
 
+        # CMA minimalizuje, więc zwracamy ujemną nagrodę
         return -total_rewards
 
     def validate_agent(self, best_params, seeds):
-        """Sequential validation on fixed seeds using 1 worker."""
+        """
+        Sprawdza jednego agenta na zestawie stałych torów (Benchmark).
+        Używa jednego workera sekwencyjnie.
+        """
         num_weights = ACTION_SIZE * INPUT_SIZE
         w = best_params[:num_weights].reshape(ACTION_SIZE, INPUT_SIZE)
         b = best_params[num_weights:]
@@ -189,7 +217,7 @@ class ParallelTrainer:
         b_tensor = torch.tensor(b, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(DEVICE)
 
         total_score = 0
-        worker = self.parents[0]
+        worker = self.parents[0]  # Używamy tylko pierwszego procesu
 
         for seed in seeds:
             worker.send(('reset', seed))
@@ -245,39 +273,45 @@ def train():
     trainer = ParallelTrainer(POPULATION_SIZE)
     param_count = ACTION_SIZE * INPUT_SIZE + ACTION_SIZE
 
-    # --- NOWOŚĆ: Ładowanie istniejącego mistrza ---
-    start_params = param_count * [0]  # Domyślnie zero
+    # --- WCZYTYWANIE ISTNIEJĄCEGO MODELU (FINE-TUNING) ---
+    start_params = np.zeros(param_count)  # Domyślnie zera (gdyby nie było pliku)
     real_best_avg = -float('inf')
 
     if os.path.exists(CTRL_PATH):
         print(f"\n>>> ZNALEZIONO {CTRL_PATH} - Wczytywanie wag do kontynuacji treningu...")
         try:
             checkpoint = torch.load(CTRL_PATH, map_location=DEVICE)
-            w = checkpoint['fc.weight'].cpu().numpy().flatten()
-            b = checkpoint['fc.bias'].cpu().numpy().flatten()
-            # Łączymy wagi i bias w jeden wektor dla CMA-ES
+
+            # Używamy .data.cpu().numpy() aby uniknąć błędu 'requires_grad'
+            w = checkpoint['fc.weight'].data.cpu().numpy().flatten()
+            b = checkpoint['fc.bias'].data.cpu().numpy().flatten()
+
             start_params = np.concatenate([w, b])
             print(">>> Wagi wczytane pomyślnie.")
         except Exception as e:
             print(f"!!! Błąd ładowania wag: {e}. Startuję od zera.")
+            start_params = np.zeros(param_count)
     else:
         print("\n>>> Brak zapisanego modelu. Startuję od zera.")
 
     print(f"Trening na: {DEVICE} | Populacja: {POPULATION_SIZE}")
     print(f"Logi: {LOG_FILE}")
 
-    # Stałe seedy walidacyjne
+    # Stałe seedy walidacyjne (Trudne tory)
     VALIDATION_SEEDS = [1001, 2002, 3003, 4004, 5005, 6006, 7007, 8008, 9009, 10010]
 
-    # --- NOWOŚĆ: Initial Validation (Baseline) ---
-    if os.path.exists(CTRL_PATH):
+    # --- Initial Validation (Baseline) ---
+    # Jeśli wczytaliśmy model, sprawdźmy jak dobry jest na starcie
+    if np.any(start_params):
         print(">>> Wykonywanie walidacji startowej na modelu bazowym...")
         real_best_avg = trainer.validate_agent(start_params, seeds=VALIDATION_SEEDS)
         print(f">>> Startowy wynik walidacji (Baseline): {real_best_avg:.1f} pkt")
 
-    # Inicjalizacja CMA-ES z punktem startowym (x0)
-    # sigma 0.1 jest dobra do eksploracji. Jeśli chcesz tylko lekki tuning, można zmniejszyć (np. 0.05)
-    es = cma.CMAEvolutionStrategy(start_params, 0.1, {
+    # Inicjalizacja CMA-ES
+    # sigma=0.1 dla startu od zera, sigma=0.08 dla fine-tuningu (bardziej precyzyjnie)
+    initial_sigma = 0.08 if np.any(start_params) else 0.1
+
+    es = cma.CMAEvolutionStrategy(start_params, initial_sigma, {
         'popsize': POPULATION_SIZE,
         'seed': 42
     })
@@ -286,13 +320,14 @@ def train():
         for gen in range(GENERATIONS):
             start = time.time()
 
-            # 1. Pobierz populację (CMA-ES mutuje start_params)
+            # 1. Pobierz populację
             solutions = es.ask()
 
             # 2. Trening (Losowy tor)
             rewards = trainer.batched_rollout(solutions)
             es.tell(solutions, rewards)
 
+            # Statystyki
             best_train_score = -min(rewards)
             mean_train_score = -np.mean(rewards)
             best_idx = np.argmin(rewards)
@@ -308,12 +343,12 @@ def train():
             dummy.bias.data = torch.tensor(b, dtype=torch.float32)
             torch.save({'fc.weight': dummy.weight, 'fc.bias': dummy.bias}, BACKUP_PATH)
 
-            # 3. WALIDACJA (tylko obiecujące)
+            # 3. WALIDACJA (tylko obiecujące modele)
             if best_train_score > 100:
                 avg_val_score = trainer.validate_agent(best_params_gen, seeds=VALIDATION_SEEDS)
                 print(f" | VAL AVG={avg_val_score:.1f}", end="")
 
-                # Zapisujemy TYLKO jeśli pobiliśmy nasz wczytany na starcie wynik
+                # Nadpisujemy Mistrza TYLKO jeśli wynik jest lepszy niż rekord
                 if avg_val_score > real_best_avg:
                     real_best_avg = avg_val_score
                     torch.save({'fc.weight': dummy.weight, 'fc.bias': dummy.bias}, CTRL_PATH)
